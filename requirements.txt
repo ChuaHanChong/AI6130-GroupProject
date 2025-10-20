@@ -11,3 +11,4 @@ langchain-huggingface==0.3.1
 langchain-google-genai==2.1.2
 langchain-community==0.3.31
 ragatouille==0.0.9.post2
+sentencepiece==0.2.1

@@ -1,3 +1,6 @@
 [submodule "ragbench"]
 	path = ragbench
 	url = git@github.com:ChuaHanChong/ragbench.git
+[submodule "self_reflection"]
+	path = self_reflection
+	url = git@github.com:ChuaHanChong/Self_Reflection_Medical.git
