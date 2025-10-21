@@ -4,3 +4,6 @@
 [submodule "self_reflection"]
 	path = self_reflection
 	url = git@github.com:ChuaHanChong/Self_Reflection_Medical.git
+[submodule "transformers"]
+	path = transformers
+	url = https://github.com/huggingface/transformers.git
