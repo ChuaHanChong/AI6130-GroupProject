@@ -4,3 +4,6 @@
 [submodule "transformers"]
 	path = transformers
 	url = https://github.com/huggingface/transformers.git
+[submodule "ragbench"]
+	path = ragbench
+	url = git@github.com:ChuaHanChong/ragbench.git
