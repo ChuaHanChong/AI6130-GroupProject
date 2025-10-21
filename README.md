@@ -3,8 +3,13 @@
 ## Development
 
 ```bash
+git clone --recurse-submodules git@github.com:ChuaHanChong/AI6130-GroupProject.git
+```
+
+```bash
 conda create --name AI6130 python=3.12
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+pip install -e transformers
 pip install -r requirements.txt
 ```
 
