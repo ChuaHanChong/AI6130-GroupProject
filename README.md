@@ -13,6 +13,11 @@ pip install -e transformers
 pip install -r requirements.txt
 ```
 
+```bash
+git rm -f path/to/submodule
+rm -rf .git/modules/path/to/submodule
+```
+
 ## References
 
 - https://github.com/kotanarik/RAGBenchAndRGB/tree/main#
