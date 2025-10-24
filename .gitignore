@@ -2,3 +2,4 @@ __archive__/
 __pycache__/
 .vscode/
 .env
+vector_store/
