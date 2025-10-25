@@ -39,6 +39,8 @@ def _dola_select_contrast(
     candidate_premature_layers: list[int],
     candidate_premature_logits: dict[int, torch.FloatTensor],
     final_logits: torch.FloatTensor,
+    info_layer_score: torch.FloatTensor,
+    alpha: float = 0.5,
 ) -> torch.FloatTensor:
     if len(candidate_premature_layers) == 1:
         base_logits = candidate_premature_logits[candidate_premature_layers[0]]
@@ -79,19 +81,29 @@ def _dola_select_contrast(
     base_logits = candidate_premature_logits[premature_layer]
     final_logits, base_logits = _relative_top_filter(final_logits, base_logits)
     logits = final_logits - base_logits
+
+    # Activation Decoding
+    info_layer_probs = F.softmax(torch.t(info_layer_score), dim=1).unsqueeze(0) # info_layer_score: [num_token_in_question, len_token_lib]
+    entropy = torch.distributions.Categorical(probs=info_layer_probs, validate_args=False).entropy()
+
+    mask = final_logits[0] < -1e3 
+    index_nontop=torch.argwhere(mask).squeeze() 
+
+    final_entropy = entropy.scatter(1, index_nontop.unsqueeze(0), float("Inf")) 
+    logits = logits + alpha * (-final_entropy)
     return logits
 
 
 def _dola_decoding(
-        model,
-        input_ids: torch.LongTensor,
-        logits_processor: LogitsProcessorList,
-        stopping_criteria: StoppingCriteriaList,
-        generation_config: GenerationConfig,
-        synced_gpus: bool = False,
-        streamer: "BaseStreamer" = None,
-        **model_kwargs,
-    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+    model,
+    input_ids: torch.LongTensor,
+    logits_processor: LogitsProcessorList,
+    stopping_criteria: StoppingCriteriaList,
+    generation_config: GenerationConfig,
+    synced_gpus: bool = False,
+    streamer: "BaseStreamer" = None,
+    **model_kwargs,
+) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
         Generates sequences of token ids for models with a language modeling head using **dola decoding** and can be
         used for decoder-only text models.
@@ -129,7 +141,7 @@ def _dola_decoding(
             `model.config.is_encoder_decoder=True`.
         """
         dola_layers: Union[str, list[int]] = generation_config.dola_layers
-
+        alpha: float = generation_config.alpha
 
         # 1. General sanity checks
         # A few arguments are not allowed, especially arguments that control caches.
@@ -255,9 +267,16 @@ def _dola_decoding(
             if synced_gpus and this_peer_finished:
                 continue
 
+            info_layer_score = outputs.logits[-1, :, :].float()
+
             next_token_logits = _dola_select_contrast(
-                candidate_premature_layers, candidate_premature_logits, final_logits
+                candidate_premature_layers, 
+                candidate_premature_logits, 
+                final_logits, 
+                info_layer_score, 
+                alpha=alpha,
             )
+
             next_token_logits = next_token_logits.to(input_ids.device)
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)

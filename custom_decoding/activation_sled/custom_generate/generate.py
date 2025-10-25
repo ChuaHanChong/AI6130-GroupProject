@@ -10,79 +10,71 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _relative_top_filter(
-    scores: torch.FloatTensor,
-    baseline_scores: torch.FloatTensor,
-    relative_top: float = 0.1,
-    filter_value: float = -float("Inf"),
-    base_filter_value=-1e-3,
-    min_tokens_to_keep: int = 1,
-) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-    """
-    Reference: https://github.com/XiangLi1999/ContrastiveDecoding/blob/170e9142e92159c1237d731e240f5eb14aabf428/transformers/src/transformers/generation_logits_process.py#L235
-    Apply filtering to only keep tokens with a probability above a certain threshold. The threshold is defined as `relative_top` * max probability in the distribution.
-    """
-    scores_normalized = scores.log_softmax(dim=-1)
-    baseline_scores_normalized = baseline_scores.log_softmax(dim=-1)
-    sorted_logits, sorted_indices = torch.sort(scores_normalized, descending=True)
-    min_thresh = sorted_logits[..., min_tokens_to_keep - 1]
-    probs_max = torch.max(scores_normalized, dim=-1).values
-    probs_thresh = probs_max + np.log(relative_top)
-    probs_thresh = torch.min(min_thresh, probs_thresh)
-    probs_thresh = probs_thresh.unsqueeze(-1)
-    baseline_scores_normalized[scores_normalized < probs_thresh] = base_filter_value
-    scores_normalized[scores_normalized < probs_thresh] = filter_value
-    return scores_normalized, baseline_scores_normalized
-
-
-def _dola_select_contrast(
+def _sled_select_contrast(
     candidate_premature_layers: list[int],
     candidate_premature_logits: dict[int, torch.FloatTensor],
     final_logits: torch.FloatTensor,
+    info_layer_score: torch.FloatTensor,
+    evolution_scale: int = 5,
+    evolution_rate: float = 0.3,
+    evolution_lower_bound: float = -10.0,
+    alpha: float = 0.5,
 ) -> torch.FloatTensor:
-    if len(candidate_premature_layers) == 1:
-        base_logits = candidate_premature_logits[candidate_premature_layers[0]]
-        final_logits, base_logits = _relative_top_filter(final_logits, base_logits)
-        logits = final_logits - base_logits
-        return logits
-
-    # 1. Stacking all premature_layers into a new dimension
     stacked_premature_layers = torch.stack([candidate_premature_logits[i] for i in candidate_premature_layers], dim=0)
-
-    # 2. Calculate the softmax values for mature_layer and all premature_layers
-    # shape: (batch_size, vocab_size)
     softmax_mature_layer = F.softmax(final_logits, dim=-1)
-    # shape: (num_premature_layers, batch_size, vocab_size)
     softmax_premature_layers = F.softmax(stacked_premature_layers, dim=-1)
+    topk_prob, topk_indices = torch.topk(softmax_mature_layer, evolution_scale)
+    topk_indices = topk_indices[0]
 
-    # 3. Calculate the average distribution
-    # shape: (num_premature_layers, batch_size, vocab_size)
-    avg_dist = 0.5 * (softmax_mature_layer[None, :, :] + softmax_premature_layers)
+    divergence = stacked_premature_layers - final_logits
+    candidate_gradients_expanded = softmax_premature_layers.expand(-1, len(topk_indices), -1)
+    candidate_mask = torch.zeros_like(candidate_gradients_expanded)
+    topk_indices_expanded = topk_indices.unsqueeze(0).unsqueeze(2)
+    candidate_mask.scatter_(2, topk_indices_expanded.expand(softmax_premature_layers.size(0), -1, -1), 1)
 
-    # 4. Calculate log-softmax for the KL divergence
-    # shape: (batch_size, vocab_size)
-    log_softmax_mature_layer = F.log_softmax(final_logits, dim=-1)
-    # shape: (num_premature_layers, batch_size, vocab_size)
-    log_softmax_premature_layers = F.log_softmax(stacked_premature_layers, dim=-1)
+    candidate_gradients_expanded = candidate_gradients_expanded - candidate_mask
+    candidate_gradients_expanded = candidate_gradients_expanded.to(torch.float32)
+    layer_divergence_expanded = divergence.to(torch.float32)
 
-    # 5. Calculate the KL divergences and then the JS divergences
-    # shape: (num_premature_layers, batch_size)
-    kl1 = F.kl_div(log_softmax_mature_layer[None, :, :], avg_dist, reduction="none").mean(-1)
-    # shape: (num_premature_layers, batch_size)
-    kl2 = F.kl_div(log_softmax_premature_layers, avg_dist, reduction="none").mean(-1)
-    js_divs = 0.5 * (kl1 + kl2)  # shape: (num_premature_layers, batch_size)
+    layer_dot_results = F.cosine_similarity(candidate_gradients_expanded, layer_divergence_expanded, dim=2)
+    layer_topk_values, layer_topk_indices = torch.topk(layer_dot_results, evolution_scale)
+    layer_topk_topk_indices = topk_indices[layer_topk_indices]
 
-    # 6. Reduce the batchmean
-    js_divs = js_divs.mean(-1)  # shape: (num_premature_layers,)
-    premature_layer = candidate_premature_layers[int(js_divs.argmax().item())]
+    layer_topk_values = (layer_topk_values * (layer_topk_values > 0)) ** 2
+    layer_topk_values_sum_layers = torch.sum(layer_topk_values, dim=1).clone()
+    non_zero_indices = layer_topk_values_sum_layers != 0
+    layer_topk_values[non_zero_indices] /= layer_topk_values_sum_layers[non_zero_indices].unsqueeze(1)
+    if layer_topk_values_sum_layers.sum() != 0:
+        layer_topk_values_sum_layers = layer_topk_values_sum_layers / layer_topk_values_sum_layers.sum()
+    proxy_gradients_tensor_delta = torch.zeros_like(softmax_mature_layer,device=layer_divergence_expanded.device).to(layer_divergence_expanded.dtype).repeat(layer_topk_values.size(0), 1)
+    proxy_gradients_tensor_delta.scatter_(1, layer_topk_topk_indices, -layer_topk_values)
+    proxy_gradients_tensor_delta = torch.sum(proxy_gradients_tensor_delta * layer_topk_values_sum_layers.unsqueeze(1), dim=0)
+    proxy_gradients_tensor_delta = proxy_gradients_tensor_delta.to(softmax_mature_layer.dtype)
+    hidden_states_seq_i = final_logits.clone()
 
-    base_logits = candidate_premature_logits[premature_layer]
-    final_logits, base_logits = _relative_top_filter(final_logits, base_logits)
-    logits = final_logits - base_logits
-    return logits
+    op_T = 1
+    evolution_rate_scheduler = [evolution_rate * (1 - i / op_T) for i in range(op_T)]
+    for op_t in range(op_T):
+        er_t = evolution_rate_scheduler[op_t]
+        # Compute softmax only once and update it iteratively if necessary
+        softmax_hidden_states_seq_i = F.softmax(hidden_states_seq_i, dim=-1)
+        proxy_gradients_tensor = softmax_hidden_states_seq_i + proxy_gradients_tensor_delta
+        # In-place update to reduce memory overhead
+        hidden_states_seq_i.sub_(er_t * proxy_gradients_tensor)
+
+    hidden_states_seq_i_new = torch.full_like(hidden_states_seq_i[0], fill_value=evolution_lower_bound, device=hidden_states_seq_i.device, dtype=hidden_states_seq_i.dtype)
+    hidden_states_seq_i_new[topk_indices] = hidden_states_seq_i[0, topk_indices]
+    next_token_logits = hidden_states_seq_i_new.unsqueeze(dim=0)
+
+    # Activation Decoding
+    info_layer_probs = F.softmax(torch.t(info_layer_score), dim=1).unsqueeze(0) # info_layer_score: [num_token_in_question, len_token_lib]
+    entropy = torch.distributions.Categorical(probs=info_layer_probs, validate_args=False).entropy()
+
+    next_token_logits = next_token_logits + alpha * (-entropy)
+    return next_token_logits
 
 
-def _dola_decoding(
+def _sled_decoding(
         model,
         input_ids: torch.LongTensor,
         logits_processor: LogitsProcessorList,
@@ -95,15 +87,11 @@ def _dola_decoding(
         r"""
         Generates sequences of token ids for models with a language modeling head using **dola decoding** and can be
         used for decoder-only text models.
-        The method is based on the paper "DoLa: Decoding by Contrasting Layers Improves Factuality in Large Language
+        The method is based on the paper "SELD: Decoding by Contrasting Layers Improves Factuality in Large Language
         Models" (https://huggingface.co/papers/2309.03883) in ICLR 2024.
         Parameters:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
                 The sequence used as a prompt for the generation.
-            dola_layers (`Union[str, list[int]]`):
-                The candidate layers used in contrasting layers of DoLa. It can be either 1) 'low' or 'high', which
-                means the lower part or higher part of the model layers, respectively, or 2) a list of layer indices
-                to be used for candidate layers. The 0-th layer is the word embedding layer of the model.
             logits_processor (`LogitsProcessorList`):
                 An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
                 used to modify the prediction scores of the language modeling head applied at each generation step.
@@ -128,34 +116,38 @@ def _dola_decoding(
             `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
         """
-        dola_layers: Union[str, list[int]] = generation_config.dola_layers
-
+        evolution_rate: float = generation_config.evolution_rate
+        evolution_scale: int = generation_config.evolution_scale
+        evolution_lower_bound: float = generation_config.evolution_lower_bound
+        alpha: float = generation_config.alpha
 
         # 1. General sanity checks
         # A few arguments are not allowed, especially arguments that control caches.
-        assert dola_layers is not None, "dola_layers must be set to use DoLa decoding"
+        assert evolution_rate is not None, "`evolution_rate` must be set for SELD decoding."
+        assert evolution_scale is not None, "`evolution_scale` must be set for SELD decoding."
+        assert evolution_lower_bound is not None, "`evolution_lower_bound` must be set for SELD decoding."
 
-        # DoLa generation needs num_beams == 1
+        # SELD generation needs num_beams == 1
         if getattr(generation_config, "num_beams", 1) != 1:
-            raise ValueError("DoLa generation needs num_beams == 1")
+            raise ValueError("SELD generation needs num_beams == 1")
         
         if model.config.is_encoder_decoder:
-            raise ValueError("DoLa decoding is only available for decoder-only models.")
+            raise ValueError("SELD decoding is only available for decoder-only models.")
 
         if generation_config.repetition_penalty < 1.2:
             logger.warning(
                 f"`repetition_penalty` is set to a value of {generation_config.repetition_penalty}, which could induce unwanted repetition. "
-                "The recommended value for DoLa decoding is `repetition_penalty>=1.2`.",
+                "The recommended value for SELD decoding is `repetition_penalty>=1.2`.",
             )
 
         if getattr(model, "_is_stateful", False):
-            # DoLa decoding was not designed for stateful models, and would require some changes
+            # SELD decoding was not designed for stateful models, and would require some changes
             raise ValueError(
-                f"DoLa decoding is not supported with stateful models, such as {model.__class__.__name__}"
+                f"SELD decoding is not supported with stateful models, such as {model.__class__.__name__}"
             )
 
         if model.config.is_encoder_decoder:
-            raise ValueError("DoLa decoding is only available for decoder-only models.")
+            raise ValueError("SELD decoding is only available for decoder-only models.")
         
         # init values
         pad_token_id = generation_config._pad_token_tensor
@@ -181,12 +173,12 @@ def _dola_decoding(
 
         this_peer_finished = False
 
-        # prepare layers for DoLa decoding
+        # prepare layers for SELD decoding
         final_layer = model.config.get_text_config().num_hidden_layers
         # if the model has tied word embeddings, we skip the word embeddings (0-th) layer and start from the 2nd layer,
         # as the early exit from word embeddings will become identity function
         # if the model is really shallow (<=2 layers), we use the 1st layer if it's not the final layer and the 0-th
-        # layer otherwise. Notice that DoLa does not help shallow models much.
+        # layer otherwise.
         if not model.config.tie_word_embeddings:
             start_layer = 0
         elif final_layer > 2:
@@ -196,34 +188,11 @@ def _dola_decoding(
         else:
             start_layer = 0
 
-        # For `N`-layer models with `N <= 40` layers, the layers of `range(0, N // 2, 2)` and `range(N // 2, N, 2)`
-        # are used for `'low'` and `'high'` layers, respectively.
-        # For models with `N > 40` layers, the layers of `range(0, 20, 2)` and `range(N - 20, N, 2)` are used for
-        # `'low'` and `'high'` layers, respectively.
-        if isinstance(dola_layers, str) and dola_layers == "low":
-            if start_layer == final_layer // 2:
-                candidate_premature_layers = [start_layer]
-            else:
-                candidate_premature_layers = (
-                    list(range(start_layer, final_layer // 2, 2))
-                    if final_layer <= 40
-                    else list(range(start_layer, 20, 2))
-                )
-        elif isinstance(dola_layers, str) and dola_layers == "high":
-            candidate_premature_layers = (
-                list(range(final_layer // 2, final_layer, 2))
-                if final_layer <= 40
-                else list(range(final_layer - 20, final_layer, 2))
-            )
-        # Set the `dola_layers` to a list of integers for layer indices to contrast manually specified layers.
-        elif isinstance(dola_layers, list):
-            candidate_premature_layers = [i for i in dola_layers if i < final_layer]
-        else:
-            raise ValueError("dola_layers must be either 'low', 'high' or a list of integers.")
+        candidate_premature_layers = list(range(start_layer, final_layer))
 
         lm_head = model.get_output_embeddings()
         if lm_head is None:
-            raise ValueError("DoLa is not supported for models that don't have output embeddings.")
+            raise ValueError("SELD is not supported for models that don't have output embeddings.")
 
         while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
@@ -242,9 +211,7 @@ def _dola_decoding(
             final_logits = outputs.logits[:, -1, :].float()
             candidate_premature_logits = {}
             for candidate_premature_layer in candidate_premature_layers:
-                candidate_premature_logits[candidate_premature_layer] = lm_head(
-                    outputs.hidden_states[candidate_premature_layer][:, -1, :]
-                ).to(final_logits.device)
+                candidate_premature_logits[candidate_premature_layer] = lm_head(outputs.hidden_states[candidate_premature_layer][:, -1, :]).to(final_logits.device)
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = model._update_model_kwargs_for_generation(
@@ -255,8 +222,17 @@ def _dola_decoding(
             if synced_gpus and this_peer_finished:
                 continue
 
-            next_token_logits = _dola_select_contrast(
-                candidate_premature_layers, candidate_premature_logits, final_logits
+            info_layer_score = outputs.logits[-1, :, :].float()
+
+            next_token_logits = _sled_select_contrast(
+                candidate_premature_layers, 
+                candidate_premature_logits, 
+                final_logits,
+                info_layer_score,
+                evolution_scale=evolution_scale,
+                evolution_rate=evolution_rate,
+                evolution_lower_bound=evolution_lower_bound,
+                alpha=alpha,
             )
             next_token_logits = next_token_logits.to(input_ids.device)
             # pre-process distribution
@@ -318,20 +294,16 @@ def _dola_decoding(
 
 
 def generate(model, *args, **kwargs):
-    """Custom generate function for DoLa decoding.
+    """Custom generate function for SELD decoding.
     Args:
         model (`PreTrainedModel`):
             The model to generate from.
-        dola_layers (`Union[str, list[int]]`): The layers to use for DoLa decoding. If `None`, DoLa decoding is not used. If a string, it must
-            be one of "low" or "high", which means using the lower part or higher part of the model layers, respectively.
-            "low" means the first half of the layers up to the first 20 layers, and "high" means the last half of the
-            layers up to the last 20 layers.
-            If a list of integers, it must contain the indices of the layers to use for candidate premature layers in DoLa.
-            The 0-th layer is the word embedding layer of the model. Set to `'low'` to improve long-answer reasoning tasks,
-            `'high'` to improve short-answer tasks. Check the [documentation](https://huggingface.co/transformers-community/dola)
-            or [the paper](https://huggingface.co/papers/2309.03883) for more details.
+        evolution_rate (`float`):
+            The evolution rate for SELD decoding.
+        evolution_scale (`int`):
+            The evolution scale for SELD decoding.
+        evolution_lower_bound (`float`):
+            The evolution lower bound for SELD decoding.
     """
-    generation_outputs = GenerationMixin.generate(
-        model, *args, custom_generate=_dola_decoding, **kwargs
-    )
+    generation_outputs = GenerationMixin.generate(model, *args, custom_generate=_sled_decoding, **kwargs)
     return generation_outputs
