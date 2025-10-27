@@ -60,7 +60,7 @@ Additional resources for understanding the metrics:
 
 ## Experiments
 
-Due to resource constraints, only 100 samples from each dataset are used for all experiments.
+Due to resource constraints, only 100 sample questions from test split of each dataset are used for experiments.
 
 ### Baselines
 
@@ -140,6 +140,8 @@ Three combinations of LLMs and embedding models are used:
 1. Qwen/Qwen3-4B-Instruct-2507 + Qwen/Qwen3-Embedding-0.6B
 2. meta-llama/Llama-3.2-3B-Instruct + Qwen/Qwen3-Embedding-0.6B
 3. google/gemma-3-4b-it + google/embeddinggemma-300m
+
+Documents from train, validation, and test splits are all used as the knowledge source for retrieval.
 
 The prompt template is as follows:
 
